@@ -1,11 +1,9 @@
-use std::{io, net::TcpStream, io::Write};
-
 use num_traits::FromPrimitive;
-use serde::{Serialize, Deserialize};
+use tokio::{net::{TcpStream, tcp::{OwnedReadHalf, OwnedWriteHalf}}, io::{AsyncWriteExt, AsyncReadExt}};
 use crate::{opcode::Opcode, error::Err};
 
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Debug, Clone)]
 pub struct Packet {
     opcode: u8,
     length: usize,
@@ -29,12 +27,14 @@ impl Packet {
         }
     }
 
+    // keepalive packet
+    pub fn ka() -> Packet {
+        Packet { opcode: Opcode::KeepAlive as u8, length: 0, payload: Vec::new()}
+    }
+
+    // error packet
     pub fn error(error: Err) -> Packet {
-        Packet {
-            opcode: Opcode::Err as u8,
-            length: 1,
-            payload: vec![error as u8]
-        }
+        Packet::new(Opcode::Err, format!("{}", error))
     }
 
 
@@ -60,10 +60,11 @@ impl Packet {
     pub fn payload_str(&self) -> String {
         match String::from_utf8(self.payload.clone()) {
             Ok(s) => s,
-            Err(e) => "".to_string()
+            Err(_) => "".to_string()
         }
     }
 
+    // convert the packet into a vector of bytes
     pub fn as_bytes(&self) -> Vec<u8> {
         let mut bytes = self.payload.clone();
         bytes.insert(0, self.opcode);
@@ -71,6 +72,28 @@ impl Packet {
         bytes
     }
 
+    // parse a vector of bytes into a packet (leaves remaining bytes)
+    pub fn parse(bs: &mut Vec<u8>) -> Option<Packet> {
+        let len = bs.len();
+        if len < 2 {
+            None
+        } else {
+            let size: usize = bs[1] as usize;
+            if size+2 <= len {
+                let op = bs.remove(0);
+                let size: usize = bs.remove(0) as usize;
+                let mut payload = Vec::new();
+                for _ in 0..size {
+                    payload.push(bs.remove(0));
+                }
+                Some(Packet{opcode: op, length: size, payload})
+            } else {
+                None
+            }
+        }
+    }
+
+    // parse a vector of bytes into a packet (consumes all bytes)
     pub fn from_bytes(mut bs: Vec<u8>) -> Result<Self, String> {
         let len = bs.len();
         if len < 2 {
@@ -87,6 +110,54 @@ impl Packet {
                     payload: bs
                 })
             }
+        }
+    }
+
+    // send a packet on a TCP stream
+    pub async fn send(self, tcp: &mut TcpStream) -> Result<(), String> {
+        match tcp.write(&self.as_bytes()).await {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e.to_string())
+        }
+    }
+
+    // send a packet on a TCP write stream
+    pub async fn send_write(self, tcp: &mut OwnedWriteHalf) -> Result<(), String> {
+        match tcp.write(&self.as_bytes()).await {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e.to_string())
+        }
+    }
+
+    // read a packet from a TCP stream
+    pub async fn from_tcp(tcp: &mut TcpStream) -> Result<Packet, String> {
+        let mut buf: [u8; 2] = [0, 0];
+        match tcp.peek(&mut buf).await {
+            Ok(_) => {
+                let size: u64 = buf[1] as u64;
+                let mut pbytes: Vec<u8> = Vec::new();
+                match tcp.take(size+2).read_to_end(&mut pbytes).await {
+                    Ok(_) => Packet::from_bytes(pbytes),
+                    Err(e) => Err(e.to_string())
+                }
+            },
+            Err(e) => Err(e.to_string())
+        }
+    }
+
+    // read a packet from a TCP read stream
+    pub async fn from_tcp_read(tcp: &mut OwnedReadHalf) -> Result<Packet, String> {
+        let mut buf: [u8; 2] = [0, 0];
+        match tcp.peek(&mut buf).await {
+            Ok(_) => {
+                let size: u64 = buf[1] as u64;
+                let mut pbytes: Vec<u8> = Vec::new();
+                match tcp.take(size+2).read_to_end(&mut pbytes).await {
+                    Ok(_) => Packet::from_bytes(pbytes),
+                    Err(e) => Err(e.to_string())
+                }
+            },
+            Err(e) => Err(e.to_string())
         }
     }
 }
